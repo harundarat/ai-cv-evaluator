@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -11,9 +11,12 @@ import { PROJECT_EVALUATION_SYSTEM_PROMPT } from './prompt/project-report-evalua
 import { FINAL_SYNTHESIS_SYSTEM_PROMPT } from './prompt/final-synthesis.prompt';
 import { CVEvaluationResult } from './dto/cv-evaluation-result.dto';
 import { ProjectEvaluationResult } from './dto/project-evaluation-result.dto';
+import { EvaluationStatus } from '@prisma/client';
 
 @Injectable()
 export class EvaluateService {
+  private readonly logger = new Logger(EvaluateService.name);
+
   constructor(
     private readonly prismaService: PrismaService,
     private readonly s3Service: S3Service,
@@ -27,7 +30,7 @@ export class EvaluateService {
     jobTitle: string,
     cvId: number,
     projectReportId: number,
-  ): Promise<{ id: number }> {
+  ): Promise<{ id: number; status: EvaluationStatus }> {
     // Validate CV and Project Report exist
     const [cv, projectReport] = await Promise.all([
       this.prismaService.cV.findUnique({
@@ -64,47 +67,7 @@ export class EvaluateService {
       projectReportId,
     });
 
-    return { id: evaluation.id };
-  }
-
-  async getEvaluationResult(evaluationId: number) {
-    const evaluation = await this.prismaService.evaluation.findUnique({
-      where: { id: evaluationId },
-    });
-
-    if (!evaluation) {
-      throw new BadRequestException('Evaluation not found');
-    }
-
-    // If status is queued or processing, return minimal info
-    if (evaluation.status === 'queued' || evaluation.status === 'processing') {
-      return {
-        id: evaluation.id,
-        status: evaluation.status,
-      };
-    }
-
-    // If status is failed, include error message
-    if (evaluation.status === 'failed') {
-      return {
-        id: evaluation.id,
-        status: evaluation.status,
-        error_message: evaluation.error_message,
-      };
-    }
-
-    // If status is completed, return full results
-    return {
-      id: evaluation.id,
-      status: evaluation.status,
-      result: {
-        cv_match_rate: evaluation.cv_match_rate,
-        cv_feedback: evaluation.cv_feedback,
-        project_score: evaluation.project_score,
-        project_feedback: evaluation.project_feedback,
-        overall_summary: evaluation.overall_summary,
-      },
-    };
+    return { id: evaluation.id, status: 'queued' };
   }
 
   async performEvaluation(
@@ -177,8 +140,11 @@ export class EvaluateService {
     jobDescription: string,
     cvRubric: string,
   ): Promise<CVEvaluationResult> {
-    // Build prompt with context
-    const prompt = `
+    this.logger.log('Starting CV evaluation...');
+
+    try {
+      // Build prompt with context
+      const prompt = `
 ${CV_EVALUATION_SYSTEM_PROMPT}
 
 JOB DESCRIPTION:
@@ -190,23 +156,35 @@ ${cvRubric}
 Please analyze the attached CV PDF and evaluate the candidate based on the job description and scoring rubric above. Provide a structured JSON response.
 `;
 
-    const response = await this.llmService.callGeminiFlashLiteWithPDF(
-      cvBuffer,
-      prompt,
-      {
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-      },
-    );
+      const response = await this.llmService.callGeminiFlashLiteWithPDF(
+        cvBuffer,
+        prompt,
+        {
+          temperature: 0.3,
+          responseMimeType: 'application/json',
+        },
+      );
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new BadRequestException('LLM response did not contain text output');
+      const resultText = response.text;
+      if (!resultText) {
+        throw new Error('LLM response did not contain text output');
+      }
+
+      const result = JSON.parse(resultText);
+
+      this.logger.log('CV evaluation completed successfully');
+      return result;
+    } catch (error) {
+      this.logger.error('CV evaluation failed', {
+        error: error.message || error,
+        stage: 'CV Evaluation (Stage 1/3)',
+      });
+
+      // Re-throw with more context
+      throw new Error(
+        `Failed to evaluate CV: ${error.message || 'Unknown error'}`,
+      );
     }
-
-    const result = JSON.parse(resultText);
-
-    return result;
   }
 
   async evaluateProjectReport(
@@ -214,8 +192,11 @@ Please analyze the attached CV PDF and evaluate the candidate based on the job d
     caseStudyBrief: string,
     projectRubric: string,
   ): Promise<ProjectEvaluationResult> {
-    // Build prompt with context from RAG
-    const prompt = `
+    this.logger.log('Starting Project Report evaluation...');
+
+    try {
+      // Build prompt with context from RAG
+      const prompt = `
 ${PROJECT_EVALUATION_SYSTEM_PROMPT}
 
 CASE STUDY BRIEF (Requirements):
@@ -227,31 +208,46 @@ ${projectRubric}
 Please analyze the attached Project Report PDF and evaluate the candidate's implementation based on the case study requirements and scoring rubric above. Provide a structured JSON response.
 `;
 
-    const response = await this.llmService.callGeminiFlashLiteWithPDF(
-      projectReportBuffer,
-      prompt,
-      {
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-      },
-    );
+      const response = await this.llmService.callGeminiFlashLiteWithPDF(
+        projectReportBuffer,
+        prompt,
+        {
+          temperature: 0.3,
+          responseMimeType: 'application/json',
+        },
+      );
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new BadRequestException('LLM response did not contain text output');
+      const resultText = response.text;
+      if (!resultText) {
+        throw new Error('LLM response did not contain text output');
+      }
+
+      const result = JSON.parse(resultText);
+
+      this.logger.log('Project Report evaluation completed successfully');
+      return result;
+    } catch (error) {
+      this.logger.error('Project Report evaluation failed', {
+        error: error.message || error,
+        stage: 'Project Report Evaluation (Stage 2/3)',
+      });
+
+      // Re-throw with more context
+      throw new Error(
+        `Failed to evaluate Project Report: ${error.message || 'Unknown error'}`,
+      );
     }
-
-    const result = JSON.parse(resultText);
-
-    return result;
   }
 
   async synthesizeFinalResult(
     cvEvaluation: CVEvaluationResult,
     projectEvaluation: ProjectEvaluationResult,
   ): Promise<{ overall_summary: string }> {
-    // Build synthesis prompt with both evaluation results
-    const prompt = `
+    this.logger.log('Starting final synthesis...');
+
+    try {
+      // Build synthesis prompt with both evaluation results
+      const prompt = `
 ${FINAL_SYNTHESIS_SYSTEM_PROMPT}
 
 CV EVALUATION RESULTS:
@@ -274,26 +270,38 @@ PROJECT EVALUATION RESULTS:
 Based on the above evaluations, provide a comprehensive final synthesis that integrates both CV and project assessment.
 `;
 
-    const response = await this.llmService.callGeminiFlash({
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
+      const response = await this.llmService.callGeminiFlash({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }],
+          },
+        ],
+        config: {
+          temperature: 0.3,
+          responseMimeType: 'application/json',
         },
-      ],
-      config: {
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-      },
-    });
+      });
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new BadRequestException('LLM response did not contain text output');
+      const resultText = response.text;
+      if (!resultText) {
+        throw new Error('LLM response did not contain text output');
+      }
+
+      const result = JSON.parse(resultText);
+
+      this.logger.log('Final synthesis completed successfully');
+      return result;
+    } catch (error) {
+      this.logger.error('Final synthesis failed', {
+        error: error.message || error,
+        stage: 'Final Synthesis (Stage 3/3)',
+      });
+
+      // Re-throw with more context
+      throw new Error(
+        `Failed to synthesize final result: ${error.message || 'Unknown error'}`,
+      );
     }
-
-    const result = JSON.parse(resultText);
-
-    return result;
   }
 }

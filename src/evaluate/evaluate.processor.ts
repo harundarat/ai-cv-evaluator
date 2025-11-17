@@ -3,6 +3,7 @@ import { Job } from 'bullmq';
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from 'src/shared/prisma.service';
 import { EvaluateService } from './evaluate.service';
+import { isRetryableError, getErrorMessage } from 'src/shared/retry.utils';
 
 interface EvaluationJobData {
   evaluationId: number;
@@ -61,7 +62,8 @@ export class EvaluationProcessor extends WorkerHost {
 
       this.logger.log(`Evaluation ${evaluationId} completed successfully`);
     } catch (error) {
-      this.logger.error(`Evaluation ${evaluationId} failed:`, error);
+      const errorMessage = getErrorMessage(error);
+      const retryable = isRetryableError(error);
 
       // Get current retry count
       const currentEvaluation = await this.prismaService.evaluation.findUnique({
@@ -69,17 +71,37 @@ export class EvaluationProcessor extends WorkerHost {
         select: { retry_count: true },
       });
 
-      // Update with error
+      const newRetryCount = (currentEvaluation?.retry_count || 0) + 1;
+
+      // Log error with detailed context
+      this.logger.error(
+        `Evaluation ${evaluationId} failed (attempt ${newRetryCount})`,
+        {
+          error: errorMessage,
+          jobTitle,
+          retryable: retryable ? 'yes' : 'no (permanent error)',
+          retryCount: newRetryCount,
+          // Note: LLM decorator already did internal retries before throwing this error
+          note: retryable
+            ? 'Error is transient but max retries exhausted at LLM level'
+            : 'Error is permanent, will not be fixed by retrying',
+        },
+      );
+
+      // Update database with error details
       await this.prismaService.evaluation.update({
         where: { id: evaluationId },
         data: {
           status: 'failed',
-          error_message: error instanceof Error ? error.message : String(error),
-          retry_count: (currentEvaluation?.retry_count || 0) + 1,
+          error_message: errorMessage,
+          retry_count: newRetryCount,
           completed_at: new Date(),
         },
       });
 
+      // Re-throw error
+      // Note: BullMQ can handle retries at the job level if configured,
+      // but our @Retry decorator already handled LLM-level retries
       throw error;
     }
   }

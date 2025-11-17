@@ -6,6 +6,10 @@ import { MulterModule } from '@nestjs/platform-express';
 import { S3Service } from 'src/shared/s3.service';
 import multerS3 from 'multer-s3';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import {
+  FILE_VALIDATION_CONSTANTS,
+  FILE_VALIDATION_ERROR_MESSAGES,
+} from './constants/file-validation.constants';
 
 @Module({
   imports: [
@@ -24,24 +28,26 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
             cb(null, `${prefix}/${Date.now()}-${safeName}`);
           },
         }),
-        // Allow only document-type uploads that the application can handle
+        // Allow only PDF files as per case study requirements
         fileFilter: (req, file, cb) => {
-          const allowedMimes = [
-            'application/pdf',
-            'text/plain',
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          ];
-
           const filename = file?.originalname ?? '';
-          const isAllowed =
-            allowedMimes.includes(file.mimetype) ||
-            /\.(pdf|txt|docx|doc)$/i.test(filename);
 
-          if (!isAllowed) {
+          // Check MIME type against allowed types
+          const isMimeTypeValid =
+            FILE_VALIDATION_CONSTANTS.ALLOWED_MIME_TYPES.includes(
+              file.mimetype as any,
+            );
+
+          // Check file extension against allowed extensions
+          const isExtensionValid =
+            FILE_VALIDATION_CONSTANTS.ALLOWED_EXTENSIONS.some((ext) =>
+              filename.toLowerCase().endsWith(ext.toLowerCase()),
+            );
+
+          if (!isMimeTypeValid || !isExtensionValid) {
             return cb(
               new BadRequestException(
-                'Only PDF, TXT and DOC/DOCX files are allowed',
+                FILE_VALIDATION_ERROR_MESSAGES.ONLY_PDF_ALLOWED,
               ),
               false,
             );
@@ -49,7 +55,11 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 
           cb(null, true);
         },
-        limits: { fileSize: 10 * 1024 * 1024 },
+        // File size and count limits
+        limits: {
+          fileSize: FILE_VALIDATION_CONSTANTS.MAX_FILE_SIZE_BYTES,
+          files: FILE_VALIDATION_CONSTANTS.MAX_FILES_COUNT,
+        },
       }),
     }),
     SharedModule,

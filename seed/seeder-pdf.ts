@@ -9,11 +9,68 @@ import { ChromaClient, Collection } from 'chromadb';
 // 1. SETUP & CONFIGURATION
 // ===================================================================
 
-const PDF_PATH = join(__dirname, 'backend_case_study_clean.pdf');
 const COLLECTION_NAME = 'ground_truth';
 
 // Maximum allowed characters per section (to detect extraction failures)
 const MAX_CHARS_PER_SECTION = 15000;
+
+// ===================================================================
+// 1b. CLI ARGUMENT PARSING
+// ===================================================================
+
+interface CliArgs {
+  file: string;
+  role: string;
+}
+
+function parseCliArgs(): CliArgs {
+  const args = process.argv.slice(2);
+  const parsed: Partial<CliArgs> = {};
+
+  for (const arg of args) {
+    if (arg.startsWith('--file=') || arg.startsWith('-f=')) {
+      parsed.file = arg.split('=')[1];
+    } else if (arg.startsWith('--role=') || arg.startsWith('-r=')) {
+      parsed.role = arg.split('=')[1];
+    }
+  }
+
+  return parsed as CliArgs;
+}
+
+function validateCliArgs(args: Partial<CliArgs>): args is CliArgs {
+  if (!args.file || !args.role) {
+    console.error('\n❌ Missing required arguments!\n');
+    console.log('Usage:');
+    console.log('  npx ts-node seed/seeder-pdf.ts --file=<filename> --role=<role>\n');
+    console.log('Arguments:');
+    console.log('  --file, -f    PDF filename (e.g., backend_case_study.pdf)');
+    console.log('  --role, -r    Role for metadata (e.g., backend, frontend, fullstack)\n');
+    console.log('Example:');
+    console.log('  npx ts-node seed/seeder-pdf.ts --file=backend_case_study.pdf --role=backend\n');
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeFilename(filename: string): string {
+  // Extract base filename without extension and sanitize
+  const baseName = filename
+    .replace(/\.pdf$/i, '')
+    .replace(/[^a-zA-Z0-9]/g, '_')
+    .toLowerCase();
+  return baseName;
+}
+
+function generateDocumentIds(baseFilename: string, role: string): string[] {
+  return [
+    `jd_${role}_${baseFilename}`,
+    `brief_${role}_${baseFilename}`,
+    `rubric_cv_${role}_${baseFilename}`,
+    `rubric_project_${role}_${baseFilename}`,
+  ];
+}
 
 // ===================================================================
 // 2. FUNGSI EKSTRAKSI SECTION DARI PDF MENGGUNAKAN GEMINI
@@ -115,11 +172,25 @@ async function getCollection(collectionName: string): Promise<Collection> {
 
 async function seed() {
   try {
+    // Parse and validate CLI arguments
+    const cliArgs = parseCliArgs();
+    if (!validateCliArgs(cliArgs)) {
+      process.exit(1);
+    }
+
+    const { file: filename, role } = cliArgs;
+
     console.log('🚀 Starting PDF-based seeding process...');
-    console.log(`📄 Reading PDF from: ${PDF_PATH}`);
+    console.log(`📋 Configuration:`);
+    console.log(`   - File: ${filename}`);
+    console.log(`   - Role: ${role}`);
+
+    // Construct PDF path
+    const pdfPath = join(__dirname, filename);
+    console.log(`\n📄 Reading PDF from: ${pdfPath}`);
 
     // Baca file PDF
-    const pdfBuffer = readFileSync(PDF_PATH);
+    const pdfBuffer = readFileSync(pdfPath);
     console.log(`✅ PDF loaded successfully (${pdfBuffer.length} bytes)`);
 
     // Setup Gemini client
@@ -210,6 +281,16 @@ Return only the rubric table structure, no additional commentary.`,
 
     console.log('\n✅ All sections extracted successfully!');
 
+    // Generate IDs and metadata dynamically
+    const sanitizedFilename = sanitizeFilename(filename);
+    const documentIds = generateDocumentIds(sanitizedFilename, role);
+
+    console.log('\n📝 Generated document IDs:');
+    documentIds.forEach((id, index) => {
+      const labels = ['Job Description', 'Case Study Brief', 'CV Rubric', 'Project Rubric'];
+      console.log(`   - ${labels[index]}: ${id}`);
+    });
+
     // Connect ke ChromaDB
     console.log('\n📦 Connecting to ChromaDB...');
     const collection = await getCollection(COLLECTION_NAME);
@@ -220,18 +301,18 @@ Return only the rubric table structure, no additional commentary.`,
       documents: [jobDescription, caseStudyBrief, rubricCv, rubricProject],
       metadatas: [
         // Metadata untuk Job Description
-        { type: 'job_description', role: 'backend' },
+        { type: 'job_description', role },
 
         // Metadata untuk Case Study Brief
-        { type: 'case_study_brief', role: 'backend' },
+        { type: 'case_study_brief', role },
 
         // Metadata untuk CV Rubric
-        { type: 'rubric', for: 'cv', role: 'backend' },
+        { type: 'rubric', for: 'cv', role },
 
         // Metadata untuk Project Rubric
-        { type: 'rubric', for: 'project', role: 'backend' },
+        { type: 'rubric', for: 'project', role },
       ],
-      ids: ['jd_backend_1', 'brief_backend_1', 'rubric_cv_backend_1', 'rubric_project_backend_1'],
+      ids: documentIds,
     });
 
     // Verify

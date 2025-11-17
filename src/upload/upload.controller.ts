@@ -3,9 +3,11 @@ import {
   Post,
   UploadedFiles,
   UseInterceptors,
+  UsePipes,
 } from '@nestjs/common';
 import { FileFieldsInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
+import { FilesValidationPipe } from './validators/file-validation.pipe';
 
 @Controller('upload')
 export class UploadController {
@@ -18,6 +20,7 @@ export class UploadController {
       { name: 'project_report', maxCount: 1 },
     ]),
   )
+  @UsePipes(FilesValidationPipe)
   async uploadFile(
     @UploadedFiles()
     files: {
