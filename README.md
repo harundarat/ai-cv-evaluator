@@ -35,7 +35,7 @@ This system automates candidate evaluation through a sophisticated AI pipeline t
 - **Asynchronous Processing** using BullMQ job queue for long-running AI evaluations
 - **RAG (Retrieval-Augmented Generation)** with ChromaDB vector database for semantic search
 - **Multi-stage LLM Pipeline** with strategic model selection for cost efficiency
-- **Robust Error Handling** with retry tracking and detailed error messages
+- **Robust Error Handling** with automatic retry mechanism (exponential backoff) and smart error classification
 - **PDF Processing** with multimodal AI for direct document analysis
 
 ---
@@ -160,7 +160,11 @@ simple-ai-recruiter-assistant/
 │   ├── upload/
 │   │   ├── upload.controller.ts  # POST /upload endpoint
 │   │   ├── upload.service.ts     # S3 upload & DB storage logic
-│   │   └── upload.module.ts
+│   │   ├── upload.module.ts
+│   │   ├── validators/
+│   │   │   └── file-validation.pipe.ts  # Dual-layer file validation
+│   │   └── constants/
+│   │       └── file-validation.constants.ts  # Validation rules & messages
 │   ├── evaluate/
 │   │   ├── evaluate.controller.ts    # POST /evaluate, GET /result/:id
 │   │   ├── evaluate.service.ts       # Core evaluation logic
@@ -177,8 +181,11 @@ simple-ai-recruiter-assistant/
 │   ├── shared/
 │   │   ├── prisma.service.ts     # Prisma client singleton
 │   │   ├── s3.service.ts         # AWS S3 operations
-│   │   ├── llm.service.ts        # Gemini API wrapper
+│   │   ├── llm.service.ts        # Gemini API wrapper (with @Retry decorator)
 │   │   ├── chroma.service.ts     # ChromaDB vector search
+│   │   ├── retry.decorator.ts    # Retry decorator with exponential backoff
+│   │   ├── retry.config.ts       # Retry configuration (PDF vs text)
+│   │   ├── retry.utils.ts        # Retry utility functions
 │   │   └── shared.module.ts
 │   ├── app.module.ts
 │   └── main.ts
@@ -329,17 +336,30 @@ Ensure you have a clean, well-structured PDF in the `seed/` directory. The defau
 
 ```bash
 # Make sure ChromaDB is running first
-pnpm ts-node seed/seeder-pdf.ts
+
+# Option 1: Using npm script (recommended)
+pnpm run seed:pdf -- --file=backend_case_study_clean.pdf --role=backend
+
+# Option 2: Using npx directly
+npx ts-node seed/seeder-pdf.ts --file=backend_case_study_clean.pdf --role=backend
+
+# For different roles (frontend, fullstack, etc.)
+pnpm run seed:pdf -- --file=frontend_case_study.pdf --role=frontend
 ```
 
+**CLI Arguments:**
+- `--file` or `-f`: PDF filename in the `seed/` directory (required)
+- `--role` or `-r`: Role for metadata (backend, frontend, fullstack, etc.) (required)
+
 **What this does:**
-- Reads the PDF using Gemini multimodal AI
+- Reads the specified PDF using Gemini multimodal AI
 - Extracts 4 distinct sections:
   1. Job Description
   2. Case Study Brief
   3. CV Scoring Rubric
   4. Project Scoring Rubric
 - Validates each section (character count checks)
+- Auto-generates document IDs from filename and role
 - Generates embeddings using Google Gemini
 - Stores documents in ChromaDB with metadata for filtering
 
@@ -406,9 +426,27 @@ curl -X POST http://localhost:3000/upload \
 }
 ```
 
+**File Validation:**
+- Both files are required (CV and Project Report)
+- Only PDF files accepted (validated by MIME type and extension)
+- Maximum file size: 10MB per file
+- Dual-layer validation (Multer + validation pipes)
+
 **Error Responses:**
-- `400 Bad Request` - Missing files or invalid file format
+- `400 Bad Request` - Missing files, invalid file format, or file too large
 - `500 Internal Server Error` - S3 upload failure or database error
+
+**Example Error Messages:**
+```json
+// Missing file
+{ "statusCode": 400, "message": "Project Report file is required (PDF format)" }
+
+// Invalid file type
+{ "statusCode": 400, "message": "CV must be a PDF file. Got MIME type: image/jpeg" }
+
+// File too large
+{ "statusCode": 400, "message": "CV is too large. Maximum size is 10MB, got 12.3MB" }
+```
 
 ---
 
@@ -556,11 +594,21 @@ done
 ### 1. File Upload Process
 
 1. Client sends multipart/form-data with CV and Project Report PDFs
-2. `multer-s3` middleware uploads files directly to AWS S3
-3. File metadata (original name, S3 key, URL) saved to PostgreSQL
-4. Returns `cv_id` and `project_report_id` for later use
+2. **Validation (Dual-Layer)**:
+   - **Multer layer**: Validates file type (PDF only) and size (max 10MB)
+   - **Pipe layer**: Validates both files are present and meet all requirements
+3. `multer-s3` middleware uploads validated files directly to AWS S3
+4. File metadata (original name, S3 key, URL) saved to PostgreSQL
+5. Returns `cv_id` and `project_report_id` for later use
 
-**Key implementation:** `src/upload/upload.service.ts:8-34`
+**File validation rules:**
+- File type: PDF only (checked by MIME type `application/pdf` and extension `.pdf`)
+- File size: Maximum 10MB per file
+- Required files: Both CV and Project Report must be provided
+
+**Key implementation:**
+- Upload logic: `src/upload/upload.service.ts:8-34`
+- Validation: `src/upload/validators/file-validation.pipe.ts`
 
 ### 2. Evaluation Initialization
 
@@ -686,22 +734,37 @@ Output (JSON):
 // Record completion timestamp
 ```
 
-### 4. Error Handling
+### 4. Error Handling & Retry Mechanism
 
-If any step fails:
+**LLM-level retries (automatic with exponential backoff):**
 ```typescript
-try {
-  // Execute evaluation pipeline
-} catch (error) {
-  // Log error details
-  // Increment retry_count
-  // Store error_message
-  // Update status to 'failed'
-  // Throw error (BullMQ will handle retry if configured)
+@Retry(PDF_RETRY_CONFIG) // 4 retries, 1s initial delay
+async callGeminiFlashLiteWithPDF() {
+  // If fails: retry with 1s → 2s → 4s → 8s delays
+  // Detects transient errors (timeouts, rate limits)
+  // Fails fast on permanent errors (auth failures)
 }
 ```
 
-**Key implementation:** `src/evaluate/evaluate.processor.ts:26-85`
+**Processor-level error handling:**
+```typescript
+try {
+  // Execute evaluation pipeline (3 stages)
+  // Each stage automatically retries on transient failures
+} catch (error) {
+  // Log error with detailed context
+  // Classify error (retryable vs permanent)
+  // Increment retry_count
+  // Store error_message
+  // Update status to 'failed'
+  // Throw error
+}
+```
+
+**Key implementation:**
+- Retry logic: `src/shared/retry.decorator.ts`, `src/shared/retry.utils.ts`
+- Processor error handling: `src/evaluate/evaluate.processor.ts:64-106`
+- LLM service: `src/shared/llm.service.ts:34-67, 81-92`
 
 ### 5. RAG (Retrieval-Augmented Generation)
 
@@ -860,21 +923,60 @@ const jobDescription = await chromaService.getJobDescription("Backend Developer"
 
 ---
 
-### 7. Error Handling Strategy
+### 7. Error Handling & Retry Strategy
 
 **Current implementation:**
-- ✅ Try-catch blocks around LLM calls
+- ✅ **File upload validation** (dual-layer: Multer + validation pipes)
+- ✅ **Automatic retry with exponential backoff** for LLM API calls
+- ✅ **Smart error classification** (retryable vs permanent errors)
+- ✅ Try-catch blocks around LLM calls with stage-specific error messages
 - ✅ Error messages stored in database
 - ✅ Retry count tracking
 - ✅ Status updates (failed state)
+- ✅ Input validation for API requests
+
+**File validation includes:**
+- File type validation (PDF only, by MIME type and extension)
+- File size validation (max 10MB)
+- Required files check (both CV and Project Report)
+- Clear, actionable error messages
+
+**Retry mechanism with exponential backoff:**
+
+Implemented using decorator pattern (`@Retry`) with configurable retry policies:
+
+| LLM Operation | Model | Max Retries | Initial Delay | Backoff Multiplier |
+|---------------|-------|-------------|---------------|-------------------|
+| CV Evaluation | Flash Lite | 4 | 1000ms | 2x |
+| Project Evaluation | Flash Lite | 4 | 1000ms | 2x |
+| Final Synthesis | Flash | 3 | 500ms | 2x |
+
+**Retry-able errors (will retry):**
+- Network timeouts (ETIMEDOUT, EHOSTUNREACH)
+- Rate limiting (HTTP 429)
+- Service unavailable (HTTP 503, 504)
+- Connection errors (ECONNREFUSED, ECONNRESET)
+
+**Non-retryable errors (fail immediately):**
+- Authentication failures (HTTP 401, 403)
+- Bad requests (HTTP 400, 404)
+- Invalid API keys
+- Malformed requests
+
+**Example retry flow:**
+```
+Attempt 1: Rate limit (429) → Wait 1s
+Attempt 2: Timeout → Wait 2s
+Attempt 3: Success! ✓
+```
+
+**Implementation details:** `src/shared/retry.decorator.ts`, `src/shared/retry.utils.ts`, `src/shared/retry.config.ts`
 
 **Not implemented (future work):**
-- ❌ Automatic retry with exponential backoff
-- ❌ Rate limit handling
 - ❌ Partial result storage (if one stage succeeds but next fails)
 - ❌ Circuit breaker pattern
 
-**Reasoning:** Basic error handling is sufficient for MVP/case study. Production system would need more robust retry mechanisms.
+**Reasoning:** Retry mechanism addresses case study requirements for "handling API failures, timeouts, rate limits" and implements exponential backoff as specified. Demonstrates production-ready resilience patterns.
 
 ---
 
@@ -984,7 +1086,32 @@ Expected:
 - First call: `status: "queued"` or `"processing"`
 - Second call: `status: "completed"` with full results
 
-#### 4. Test Error Handling
+#### 4. Test File Validation
+
+```bash
+# Test missing file
+curl -X POST http://localhost:3000/upload \
+  -F "cv=@seed/Resume Harun Al Rasyid.pdf"
+
+# Expected: 400 - "Project Report file is required (PDF format)"
+
+# Test invalid file type
+curl -X POST http://localhost:3000/upload \
+  -F "cv=@test.docx" \
+  -F "project_report=@test.pdf"
+
+# Expected: 400 - "Only PDF files are allowed"
+
+# Test file too large (create 11MB file first)
+dd if=/dev/zero of=large.pdf bs=1M count=11
+curl -X POST http://localhost:3000/upload \
+  -F "cv=@large.pdf" \
+  -F "project_report=@test.pdf"
+
+# Expected: 400 - "CV is too large. Maximum size is 10MB"
+```
+
+#### 5. Test Error Handling
 
 ```bash
 # Invalid CV ID
@@ -1035,10 +1162,10 @@ describe('EvaluateService', () => {
    - E2E tests for critical user flows
 
 2. **Advanced Error Handling**
-   - Exponential backoff for LLM API retries
+   - ✅ ~~Exponential backoff for LLM API retries~~ **(IMPLEMENTED)**
    - Circuit breaker for external services
    - Partial result storage (checkpoint evaluation progress)
-   - Rate limit handling with queuing
+   - Advanced rate limit handling with adaptive backoff
 
 3. **Monitoring & Observability**
    - Structured logging (Winston or Pino)

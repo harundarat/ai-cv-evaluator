@@ -26,9 +26,4 @@ export class EvaluateController {
       evaluateRequest.project_report_id,
     );
   }
-
-  @Get('result/:id')
-  async getEvaluationResult(@Param('id', ParseIntPipe) id: number) {
-    return this.evaluateService.getEvaluationResult(id);
-  }
 }
